@@ -7,7 +7,7 @@ MEMORY_FILE = PROJECT_DIR / "music_memory.json"
 
 
 def _empty_memory() -> dict:
-    return {"liked": [], "disliked": [], "playlists": []}
+    return {"liked": [], "disliked": [], "playlists": [], "settings": {}}
 
 
 def _load() -> dict:
@@ -24,6 +24,10 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     MEMORY_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _song_text(song: dict) -> str:
+    return f"{song['artist']} - {song['track']}"
 
 
 def _key(song: dict) -> str:
@@ -76,18 +80,19 @@ def get_music_memory() -> dict:
     already appeared in previous playlists unless the user asks for them.
 
     Returns:
-        {"liked": [...], "disliked": [...], "already_suggested": [...],
-         "playlists": [{"name", "url", "created", "song_count"}]}.
+        {"liked": ["Artist - Track", ...], "disliked": [...],
+         "already_suggested": [...],
+         "playlists": [{"name", "playlist_id", "url", "created", "song_count"}]}.
+        For the songs (and video IDs) of a playlist, use get_playlist_songs.
     """
     data = _load()
     suggested = {}
     for playlist in data["playlists"]:
         for song in playlist["songs"]:
-            # Only artist + track here; video details come from get_playlist_songs.
-            suggested[_key(song)] = {"artist": song["artist"], "track": song["track"]}
+            suggested[_key(song)] = _song_text(song)
     return {
-        "liked": data["liked"],
-        "disliked": data["disliked"],
+        "liked": [_song_text(s) for s in data["liked"]],
+        "disliked": [_song_text(s) for s in data["disliked"]],
         "already_suggested": list(suggested.values()),
         "playlists": [
             {
@@ -102,12 +107,60 @@ def get_music_memory() -> dict:
     }
 
 
+# ================== User settings ==================
+
+def get_settings() -> dict:
+    """Settings the user gave in chat (not a tool)."""
+    return dict(_load().get("settings", {}))
+
+
+def update_user_settings(netfree: str = "", address_user_as: str = "") -> dict:
+    """Save a personal setting the user told you about, so it is remembered.
+
+    Settings are saved permanently (also for future sessions) until the user
+    changes them. Call this as soon as the user says something like:
+    - "I'm on NetFree" / "אני על נטפרי" / "יש לי נטפרי" -> netfree="on"
+    - "I'm not on NetFree anymore" -> netfree="off"
+    - "Talk to me in feminine form" / "אני בת" -> address_user_as="female"
+    Then confirm it to the user in one short sentence.
+
+    Args:
+        netfree: "on" or "off" to change the NetFree setting, "" to leave it.
+            In NetFree mode, blocked YouTube videos are filtered out
+            automatically and offensive words are kept out of the conversation.
+        address_user_as: "female", "male" or "neutral" to change how you
+            address the user in Hebrew, "" to leave it.
+
+    Returns:
+        {"saved": {...the new settings}}, or {"error"}.
+    """
+    changes = {}
+    if netfree:
+        if netfree not in ("on", "off"):
+            return {"error": 'netfree must be "on" or "off".'}
+        changes["netfree"] = netfree == "on"
+    if address_user_as:
+        if address_user_as not in ("female", "male", "neutral"):
+            return {"error": 'address_user_as must be "female", "male" or "neutral".'}
+        changes["address_user_as"] = address_user_as
+    if not changes:
+        return {"error": "Nothing to change. Pass netfree and/or address_user_as."}
+
+    data = _load()
+    data.setdefault("settings", {}).update(changes)
+    _save(data)
+    # Apply NetFree mode right away, for the rest of this session.
+    from tools import netfree as netfree_mode
+    if "netfree" in changes:
+        netfree_mode.set_by_user(changes["netfree"])
+    return {"saved": data["settings"]}
+
+
 def _clean_song(song: dict) -> dict:
     clean = {"artist": song["artist"], "track": song["track"]}
     video_id = (song.get("video_id") or "").strip()
     if video_id:
         clean["video_id"] = video_id
-        clean["url"] = f"https://www.youtube.com/watch?v={video_id}"
     return clean
 
 
@@ -142,7 +195,7 @@ def record_playlist(name: str, playlist_id: str, url: str, songs: list[dict]) ->
                     known[_key(song)] = song
                 elif "video_id" in song and "video_id" not in existing:
                     # Fill in the video for songs saved before video IDs were kept.
-                    existing.update(video_id=song["video_id"], url=song["url"])
+                    existing["video_id"] = song["video_id"]
             _save(data)
             return {"recorded": playlist["name"], "song_count": len(playlist["songs"])}
 
@@ -162,28 +215,38 @@ def get_playlist_songs(playlist_id: str) -> dict:
 
     Use this when the user wants to download songs from one of their playlists
     (for example "download the playlist you just made"). Get the playlist_id
-    from get_music_memory. Songs that include a "url" can be passed directly to
-    download_songs_from_youtube. Songs without a "url" (older playlists) must
-    be looked up with find_on_youtube first.
+    from get_music_memory. Songs that include a "video_id" can be passed
+    directly to download_songs_from_youtube. Songs without one (older
+    playlists) must be looked up with find_on_youtube first.
 
     Args:
         playlist_id: The playlist ID, as shown in get_music_memory.
 
     Returns:
-        {"name", "url", "songs": [{"artist", "track", "video_id"?, "url"?}],
-         "songs_missing_url": count}, or {"error"} if the playlist is unknown.
+        {"name", "url", "songs": [{"artist", "track", "video_id"?}],
+         "songs_missing_video": count}, or {"error"} if the playlist is unknown.
     """
     for playlist in _load()["playlists"]:
         if playlist["playlist_id"] == playlist_id:
-            songs = playlist["songs"]
+            songs = []
+            for s in playlist["songs"]:
+                song = {"artist": s["artist"], "track": s["track"]}
+                video_id = s.get("video_id") or _video_id_from_url(s.get("url", ""))
+                if video_id:
+                    song["video_id"] = video_id
+                songs.append(song)
             return {
                 "name": playlist["name"],
                 "url": playlist["url"],
                 "songs": songs,
-                "songs_missing_url": sum(1 for s in songs if not s.get("url")),
+                "songs_missing_video": sum(1 for s in songs if "video_id" not in s),
             }
     return {"error": f"No saved playlist with ID {playlist_id}. "
                      "Check the playlists list from get_music_memory."}
+
+
+def _video_id_from_url(url: str) -> str:
+    return url.split("v=", 1)[1][:11] if "v=" in url else ""
 
 
 if __name__ == "__main__":

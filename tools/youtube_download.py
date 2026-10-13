@@ -117,8 +117,9 @@ def download_songs_from_youtube(
     Args:
         songs: Songs to download. Each item should contain:
             - artist: Artist name
-            - track or title: Song title
-            - url or youtube_url: A direct YouTube video URL
+            - track: Song title
+            - video_id: The YouTube video ID from find_on_youtube or
+              get_playlist_songs (a full YouTube "url" also works)
         output_dir: Destination folder. Leave empty to save to the computer's
             Downloads folder (the default). If the user names a folder, pass
             it here: a full path (e.g. "D:\\Music" or "~/Music") is used as is,
@@ -203,13 +204,16 @@ def download_songs_from_youtube(
         artist = song.get("artist", "").strip()
         track = (song.get("track") or song.get("title") or "").strip()
         url = (song.get("url") or song.get("youtube_url") or "").strip()
+        video_id = (song.get("video_id") or "").strip()
+        if not url and video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
 
         if not url:
             results.append({
                 "artist": artist,
                 "track": track,
                 "status": "error",
-                "error": "Missing YouTube URL for this song.",
+                "error": "Missing video_id for this song. Get it with find_on_youtube.",
             })
             continue
 
@@ -218,6 +222,7 @@ def download_songs_from_youtube(
             # reported independently if one download fails.
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
+            netfree.note_download_success()
             results.append({
                 "artist": artist,
                 "track": track,

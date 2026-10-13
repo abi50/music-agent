@@ -8,3 +8,5 @@ youtube_cache.json
 downloads/
 __pycache__/
 netfree_cache.json
+agent_log.jsonl
+agent_log.old.jsonl

@@ -1,6 +1,10 @@
+import functools
 import os
+
 import pylast
 from dotenv import load_dotenv
+
+from tools import netfree
 
 load_dotenv()
 
@@ -20,8 +24,62 @@ _TEMPORARY = {pylast.STATUS_OFFLINE, pylast.STATUS_TEMPORARILY_UNAVAILABLE,
               pylast.STATUS_OPERATION_FAILED}
 
 
+# ================== Circuit breaker ==================
+# On some networks (e.g. NetFree) Last.fm is blocked: every call fails with an
+# empty or unreadable response. After a few such failures in a row, Last.fm is
+# turned off for the rest of the session, so the agent stops wasting rounds
+# (and tokens) on it and picks songs from its own knowledge instead.
+
+MAX_CONNECTION_FAILURES = 2
+_breaker = {"failures": 0, "open": False}
+
+LASTFM_TOOLS = ("get_similar_tracks, get_similar_artists, get_artist_top_tracks, "
+                "get_track_tags, get_tracks_by_tag, find_artist_for_song")
+
+
+def _unavailable_message() -> str:
+    cause = ("it is probably blocked by NetFree on the user's network"
+             if netfree.is_enabled() else "it cannot be reached from this network right now")
+    return (f"LAST.FM IS UNAVAILABLE: {cause}. It is turned off for the rest of this "
+            f"session - do NOT call any Last.fm tool again ({LASTFM_TOOLS}). Choose songs "
+            "from your own music knowledge, verify each one with find_on_youtube, and "
+            "identify unknown artists yourself (ask the user if unsure). Tell the user "
+            "briefly that Last.fm is not available, so the picks are based on your knowledge.")
+
+
+def _guarded(fn):
+    """Skip Last.fm entirely once the breaker is open; reset it after a success."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if _breaker["open"]:
+            error = {"error": _unavailable_message()}
+            return error if fn is find_artist_for_song_impl else [error]
+        result = fn(*args, **kwargs)
+        failed = (isinstance(result, dict) and "error" in result) or \
+                 (isinstance(result, list) and result and "error" in result[0])
+        if not failed:
+            _breaker["failures"] = 0
+        return result
+    return wrapper
+
+
+def _connection_failure() -> str:
+    """Count a failure that looks like a blocked or broken connection."""
+    _breaker["failures"] += 1
+    if _breaker["failures"] >= MAX_CONNECTION_FAILURES:
+        _breaker["open"] = True
+        return _unavailable_message()
+    return ""
+
+
 def _error(exc: Exception, not_found: str) -> list[dict]:
     """Turn any exception into a clear error message for the model."""
+    if not isinstance(exc, pylast.WSError):
+        # Not a normal Last.fm answer (like "not found") but an empty, broken
+        # or blocked response.
+        message = _connection_failure()
+        if message:
+            return [{"error": message}]
     if isinstance(exc, pylast.WSError):
         status = str(exc.status)
         if status in {str(s) for s in _KEY_PROBLEMS}:
@@ -40,7 +98,9 @@ def _error(exc: Exception, not_found: str) -> list[dict]:
     elif isinstance(exc, pylast.MalformedResponseError):
         message = "Last.fm returned an invalid response. Try again once."
     else:
-        message = f"Unexpected Last.fm error: {type(exc).__name__}: {exc}"
+        hint = " (on NetFree, Last.fm is probably blocked)" if netfree.is_enabled() else ""
+        message = (f"Last.fm returned an unreadable response{hint}: "
+                   f"{type(exc).__name__}: {exc}. Try one more Last.fm call at most.")
     return [{"error": message}]
 
 
@@ -178,7 +238,7 @@ def get_tracks_by_tag(tag: str, limit: int = 20) -> list[dict]:
 
 
 
-def find_artist_for_song(track: str, limit: int = 8) -> dict:
+def find_artist_for_song_impl(track: str, limit: int = 8) -> dict:
     """Find out WHO SINGS a song, when the user gave only the song title without the artist.
 
     This is the only tool for identifying an unknown artist. Use it ONLY when
@@ -228,6 +288,16 @@ def find_artist_for_song(track: str, limit: int = 8) -> dict:
     clear = not others or ranked[0]["listeners"] >= 3 * max(others[0]["listeners"], 1)
     return {"query": track, "candidates": ranked, "clear_match": clear}
 
+
+
+# Public tools, protected by the circuit breaker.
+get_similar_tracks = _guarded(get_similar_tracks)
+get_similar_artists = _guarded(get_similar_artists)
+get_artist_top_tracks = _guarded(get_artist_top_tracks)
+get_track_tags = _guarded(get_track_tags)
+get_tracks_by_tag = _guarded(get_tracks_by_tag)
+find_artist_for_song = _guarded(find_artist_for_song_impl)
+find_artist_for_song.__name__ = "find_artist_for_song"
 
 if __name__ == "__main__":
     from pprint import pprint
