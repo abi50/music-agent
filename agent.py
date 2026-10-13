@@ -4,7 +4,7 @@ import json
 from anthropic import Anthropic, beta_tool
 from dotenv import load_dotenv
 
-from tools import lastfm, memory, youtube, youtube_download
+from tools import lastfm, memory, netfree, youtube, youtube_download
 
 load_dotenv()
 
@@ -73,12 +73,43 @@ instead of giving up. If the YouTube quota is exhausted, tell the user and stop.
 If the download tool reports a missing dependency (yt-dlp or FFmpeg), tell the user \
 what to install and stop."""
 
+# Sent only in NetFree mode, so other users don't pay tokens for it.
+NETFREE_PROMPT = """NetFree (filtered internet):
+Some users browse through NetFree, an Israeli filtered internet provider. It blocks \
+YouTube videos that are not approved, and can block messages containing offensive words.
+- Any tool error or status that says "BLOCKED BY NETFREE" / "blocked_by_netfree" is \
+caused by the user's NetFree filter, not by a bug, quota or outdated software. Never \
+suggest updating yt-dlp or retrying the same video for it.
+- When something is blocked, say so explicitly in Hebrew, e.g. "השיר X חסום בנטפרי", \
+and suggest a replacement or that the user ask NetFree to approve it.
+- In NetFree mode prefer clean, family-friendly songs, and avoid songs whose titles \
+contain offensive words: they will likely be blocked."""
 
-def as_tool(fn):
-    """Wrap one of our functions as a Claude tool that returns a JSON string."""
+
+def system_prompt() -> list[dict]:
+    text = SYSTEM_PROMPT
+    if netfree.is_enabled():
+        text += ("\n\n" + NETFREE_PROMPT + "\n\nNetFree mode is ON: this user is on NetFree. "
+                 "find_on_youtube already removes blocked videos, so use only the "
+                 "candidates it returns.")
+    # Cache breakpoint: the tool definitions + system prompt are identical in every
+    # call, so after the first call they are read from cache at ~10% of the price.
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
+def as_tool(fn, external: bool = False):
+    """Wrap one of our functions as a Claude tool that returns a JSON string.
+
+    external=True marks tools that return text from YouTube/Last.fm. In NetFree
+    mode, items with offensive words are removed from their results before the
+    results are sent to Claude, so NetFree won't block the request.
+    """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        return json.dumps(fn(*args, **kwargs), ensure_ascii=False)
+        result = fn(*args, **kwargs)
+        if external and netfree.is_enabled():
+            result = netfree.filter_result(result)
+        return json.dumps(result, ensure_ascii=False)
     return beta_tool(wrapper)
 
 
@@ -87,49 +118,128 @@ TOOLS = [
     as_tool(memory.remember_songs),
     as_tool(memory.record_playlist),
     as_tool(memory.get_playlist_songs),
-    as_tool(lastfm.get_similar_tracks),
-    as_tool(lastfm.get_similar_artists),
-    as_tool(lastfm.get_artist_top_tracks),
-    as_tool(lastfm.get_track_tags),
-    as_tool(lastfm.get_tracks_by_tag),
-    as_tool(lastfm.find_artist_for_song),
-    as_tool(youtube.find_on_youtube),
+    as_tool(lastfm.get_similar_tracks, external=True),
+    as_tool(lastfm.get_similar_artists, external=True),
+    as_tool(lastfm.get_artist_top_tracks, external=True),
+    as_tool(lastfm.get_track_tags, external=True),
+    as_tool(lastfm.get_tracks_by_tag, external=True),
+    as_tool(lastfm.find_artist_for_song, external=True),
+    as_tool(youtube.find_on_youtube, external=True),
     as_tool(youtube.create_playlist),
     as_tool(youtube.add_to_playlist),
     as_tool(youtube_download.download_songs_from_youtube)
 ]
 
 
-def ask(client: Anthropic, history: list[dict], user_text: str) -> str:
-    history.append({"role": "user", "content": user_text})
+# Tools that change something. After a NetFree block they must not be repeated.
+CHANGING_TOOLS = {"create_playlist", "add_to_playlist", "record_playlist",
+                  "remember_songs", "download_songs_from_youtube"}
 
+
+class NetFreeBlocked(Exception):
+    """NetFree blocked the conversation with Claude, even after a retry."""
+
+    def __init__(self, tools_used: list[str]):
+        super().__init__("Blocked by NetFree")
+        self.tools_used = tools_used
+
+
+def _run(client: Anthropic, messages: list[dict], tools_used: list[str],
+         usage: dict) -> str:
     runner = client.beta.messages.tool_runner(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         max_iterations=MAX_ITERATIONS,
-        system=SYSTEM_PROMPT,
+        system=system_prompt(),
         tools=TOOLS,
-        messages=list(history),
+        messages=messages,
+        # Also cache the conversation so far: each tool round re-sends everything
+        # before it, so every round reads the previous rounds from cache.
+        cache_control={"type": "ephemeral"},
     )
-
     final_message = None
     for message in runner:
         for block in message.content:
             if block.type == "tool_use":
                 print(f"  [tool] {block.name}")
+                tools_used.append(block.name)
+        u = message.usage
+        usage["input"] += u.input_tokens or 0
+        usage["cache_write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
+        usage["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
+        usage["output"] += u.output_tokens or 0
         final_message = message
+    return "".join(b.text for b in final_message.content if b.type == "text").strip()
 
-    reply = "".join(b.text for b in final_message.content if b.type == "text").strip()
+
+def _usage_line(usage: dict) -> str:
+    total_in = usage["input"] + usage["cache_write"] + usage["cache_read"]
+    return (f"  [tokens] input {total_in:,} (from cache {usage['cache_read']:,}, "
+            f"written to cache {usage['cache_write']:,}, uncached {usage['input']:,}) | "
+            f"output {usage['output']:,}")
+
+
+def _retry_note(tools_used: list[str]) -> str:
+    done = sorted(set(tools_used) & CHANGING_TOOLS)
+    return (
+        "\n\n[Note from the app, not from the user: NetFree, the user's filtered internet "
+        "provider, blocked the previous attempt to handle this request because some text in "
+        "the tool results (probably a song or video title) matched its word filter. "
+        f"Tools that already ran before the block: {', '.join(tools_used) or 'none'}. "
+        f"These already made changes and must NOT be repeated: {', '.join(done) or 'none'}. "
+        "Use get_music_memory / get_playlist_songs to see what was already done. If the task "
+        "is not finished, continue it with clean songs only. Start your reply by telling the "
+        "user (in Hebrew) that the first attempt was blocked by NetFree and was recovered.]"
+    )
+
+
+def ask(client: Anthropic, history: list[dict], user_text: str) -> str:
+    history.append({"role": "user", "content": user_text})
+    tools_used: list[str] = []
+    usage = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
+    try:
+        reply = _run(client, list(history), tools_used, usage)
+    except Exception as e:
+        if not netfree.is_api_block(e):
+            raise
+        # NetFree blocked the request. Retry once without the blocked tool
+        # results: a fresh request that only says what was already done.
+        netfree.enable("זוהתה חסימה של נטפרי")
+        print("  [netfree] הבקשה ל-Claude נחסמה על ידי נטפרי - מנסה שוב בלי התוכן שנחסם...")
+        retry_messages = history[:-1] + [{"role": "user",
+                                          "content": user_text + _retry_note(tools_used)}]
+        try:
+            reply = _run(client, retry_messages, tools_used, usage)
+        except Exception as e2:
+            if netfree.is_api_block(e2):
+                raise NetFreeBlocked(tools_used) from e2
+            raise
+
     # Keep only the text of the final answer in the history; the details of the
     # tool calls are not needed for the next request (memory keeps what matters).
     history.append({"role": "assistant", "content": reply or "(no reply)"})
+    print(_usage_line(usage))
     return reply
+
+
+def _blocked_message(tools_used: list[str]) -> str:
+    done = sorted(set(tools_used) & CHANGING_TOOLS)
+    lines = ["⛔ נטפרי חסם את התקשורת עם Claude, גם אחרי ניסיון נוסף.",
+             "הסיבה: סינון המילים של נטפרי מצא מילה אסורה בטקסט שנשלח (כנראה שם של שיר או סרטון).",
+             "זו לא תקלה בקוד."]
+    if done:
+        lines.append(f"פעולות שכבר בוצעו לפני החסימה: {', '.join(done)}.")
+        if "create_playlist" in done:
+            lines.append("הפלייליסט כנראה נוצר - אפשר לבדוק ביוטיוב.")
+    lines.append("אפשר לנסות שוב בניסוח אחר, או לבקש מנטפרי פטור מסינון לכתובת api.anthropic.com.")
+    return "\n".join(lines)
 
 
 def main():
     client = Anthropic()
     history: list[dict] = []
-    print("Music agent ready. Type 'exit' to quit.\n")
+    print("Music agent ready. Type 'exit' to quit.")
+    print(netfree.init() + "\n")
 
     while True:
         try:
@@ -143,6 +253,14 @@ def main():
 
         try:
             reply = ask(client, history, user_text)
+        except NetFreeBlocked as e:
+            message = _blocked_message(e.tools_used)
+            # Keep the request in history, so the agent knows what happened.
+            history.append({"role": "assistant",
+                            "content": "(The reply to this request was blocked by NetFree. "
+                                       f"Tools that ran: {', '.join(e.tools_used) or 'none'}.)"})
+            print(f"\n{message}\n")
+            continue
         except Exception as e:
             history.pop()  # drop the request that failed
             print(f"\nError: {e}\n")
