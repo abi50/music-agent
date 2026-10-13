@@ -152,7 +152,7 @@ def summarize_result(result: Any, show: int = 5) -> str:
             shown = "; ".join(_describe_item(c) for c in result["candidates"][:3])
             return f"clear_match={result.get('clear_match')}; top: {shown}"
         keys = ("playlist_id", "url", "added", "saved", "recorded", "song_count", "name",
-                "songs_missing_url", "opinion")
+                "songs_missing_video", "opinion")
         parts = [f"{k}={result[k]}" for k in keys if k in result]
         if "songs" in result and isinstance(result["songs"], list):
             parts.append(f"{len(result['songs'])} songs")
