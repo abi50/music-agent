@@ -7,6 +7,7 @@ This module follows the same structure as tools/lastfm.py:
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -23,6 +24,8 @@ try:
     from yt_dlp import YoutubeDL
 except ImportError:
     YoutubeDL = None
+
+from tools import netfree
 
 
 def _windows_downloads_folder() -> Optional[Path]:
@@ -72,6 +75,35 @@ def _resolve_output_dir(output_dir: str) -> Path:
     return path
 
 
+def _video_id(url: str) -> str:
+    match = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", url)
+    return match.group(1) if match else ""
+
+
+def _describe_error(message: str, url: str) -> dict[str, str]:
+    """Turn a yt-dlp error into a status + a clear explanation for the agent."""
+    message = message.replace("ERROR: ", "").strip()
+    kind = netfree.classify_ytdlp_error(message)
+    if kind == "netfree":
+        netfree.enable("זוהתה חסימה בהורדה")
+        if _video_id(url):
+            netfree.mark_blocked(_video_id(url))
+        return {"status": "blocked_by_netfree",
+                "error": "BLOCKED BY NETFREE: this video is not approved on the user's "
+                         "filtered network. Not a bug and not a yt-dlp problem - do not "
+                         "retry this URL or suggest updating yt-dlp."}
+    if kind == "maybe_netfree":
+        return {"status": "error",
+                "error": "yt-dlp could not load this video. On a filtered network such as "
+                         "NetFree this usually means the video is blocked; otherwise yt-dlp "
+                         f"may need an update (pip install -U yt-dlp). Details: {message}"}
+    if kind == "unavailable":
+        return {"status": "error",
+                "error": f"The video is unavailable on YouTube (removed, private or "
+                         f"restricted). Try another candidate. Details: {message}"}
+    return {"status": "error", "error": message}
+
+
 def download_songs_from_youtube(
         songs: list[dict[str, str]],
         output_dir: str = "",
@@ -96,9 +128,14 @@ def download_songs_from_youtube(
 
     Returns:
         A list of result dictionaries, one per song. Successful items contain
-        artist, track, url, status, and output_dir. Failed items contain
-        artist, track, url, status="error", and error. If yt-dlp is missing,
-        returns a single error item.
+        artist, track, url, status="success", and output_dir. Failed items
+        contain artist, track, url, status and error, where status is:
+        - "blocked_by_netfree": the video is blocked on the user's NetFree
+          (filtered) network. Do NOT retry the same URL. Call find_on_youtube
+          for that song and try one other candidate; if there is none, tell the
+          user this song is blocked by NetFree.
+        - "error": any other failure; the error text explains it.
+        If yt-dlp is missing, returns a single error item.
     """
     if YoutubeDL is None:
         return [{
@@ -127,6 +164,8 @@ def download_songs_from_youtube(
         "retries": 5,
         "fragment_retries": 5,
         "no_warnings": True,
+        # Errors are returned to the agent, so don't print them to the console.
+        "logger": netfree._SilentLogger(),
     }
 
     if quality_key in {"mp3", "audio", "audio only", "אודיו בלבד (mp3)"}:
@@ -187,13 +226,8 @@ def download_songs_from_youtube(
                 "output_dir": str(destination.resolve()),
             })
         except Exception as exc:
-            results.append({
-                "artist": artist,
-                "track": track,
-                "url": url,
-                "status": "error",
-                "error": str(exc),
-            })
+            results.append({"artist": artist, "track": track, "url": url,
+                            **_describe_error(str(exc), url)})
 
     return results
 

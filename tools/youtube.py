@@ -9,6 +9,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from tools import netfree
+
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 CLIENT_SECRET_FILE = PROJECT_DIR / "client_secret.json"
 TOKEN_FILE = PROJECT_DIR / "token.json"
@@ -89,6 +91,10 @@ def find_on_youtube(artist: str, track: str) -> list[dict]:
     karaoke, reactions and lyric videos by other channels unless the user
     asked for them. If none of the candidates is the real song, skip it.
 
+    In NetFree mode, videos that are blocked on the user's network are removed
+    from the results automatically, so every candidate returned can be played
+    and downloaded. If all candidates are blocked, the error says so.
+
     Args:
         artist: The artist name.
         track: The song title.
@@ -97,6 +103,27 @@ def find_on_youtube(artist: str, track: str) -> list[dict]:
         A list of {"video_id", "title", "channel", "url"} dicts, best match
         first. On failure, a list with one {"error"} dict.
     """
+    results = _search(artist, track)
+    if "error" in results[0] or not netfree.is_enabled():
+        return results
+
+    statuses = netfree.check_videos([r["video_id"] for r in results])
+    allowed = [r for r in results if statuses.get(r["video_id"]) in ("ok", "unknown")]
+    if not allowed:
+        blocked = sum(1 for r in results if statuses.get(r["video_id"]) == "blocked")
+        return [{"error": (
+            f"BLOCKED BY NETFREE: {blocked} of the {len(results)} YouTube videos found for "
+            f"{artist} - {track} are blocked on the user's NetFree network (not approved)"
+            f"{'' if blocked == len(results) else ', and the rest are unavailable'}. "
+            "Choose a different song instead. If the user "
+            "asked for this exact song, tell them it is blocked by NetFree and that they "
+            "can ask NetFree to approve it."
+        )}]
+    return allowed
+
+
+def _search(artist: str, track: str) -> list[dict]:
+    """Search YouTube (cached). Returns candidates or [{"error"}]."""
     key = _cache_key(artist, track)
     cache = _load_cache()
     if key in cache:
