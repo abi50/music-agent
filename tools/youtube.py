@@ -100,10 +100,13 @@ def find_on_youtube(artist: str, track: str) -> list[dict]:
         track: The song title.
 
     Returns:
-        A list of {"video_id", "title", "channel", "url"} dicts, best match
-        first. On failure, a list with one {"error"} dict.
+        A list of {"video_id", "title", "channel"} dicts, best match first.
+        On failure, a list with one {"error"} dict.
     """
     results = _search(artist, track)
+    # The URL is not sent to the agent (it can be built from video_id); this
+    # saves tokens on every search.
+    results = [{k: v for k, v in r.items() if k != "url"} for r in results]
     if "error" in results[0] or not netfree.is_enabled():
         return results
 

@@ -1,10 +1,11 @@
 import functools
 import json
+import time
 
 from anthropic import Anthropic, beta_tool
 from dotenv import load_dotenv
 
-from tools import lastfm, memory, netfree, youtube, youtube_download
+from tools import lastfm, memory, netfree, session_log, youtube, youtube_download
 
 load_dotenv()
 
@@ -17,12 +18,17 @@ and build YouTube playlists for them. You can also download songs when the user 
 explicitly asks for it.
 
 How to work:
-1. At the start of every request, call get_music_memory to see what the user likes, \
-dislikes and has already received.
-2. If the user mentions songs they like or dislike, save them with remember_songs.
+1. At the start of every music request (recommendations, playlists, downloads, \
+questions about their songs), call get_music_memory to see what the user likes, \
+dislikes and has already received. Don't call it for small talk, questions about \
+you, or settings - it only costs time and tokens there.
+2. If the user mentions songs they like or dislike, save them with remember_songs. \
+If the user tells you a personal setting - that they are (or are not) on NetFree, \
+or how to address them (e.g. in feminine form) - save it with update_user_settings.
 3. Songs without an artist: if the user names a song but not who sings it (for \
 any purpose - examples, playlist, download), call find_artist_for_song first. \
-Never guess the artist yourself. If it returns clear_match true, use the top \
+Don't guess the artist yourself (only if Last.fm is unavailable: then identify it \
+from your knowledge, say whom you chose, and ask the user if unsure). If it returns clear_match true, use the top \
 candidate and mention the artist in your reply. If clear_match is false, ask the \
 user which artist they meant (show the top options) and wait for the answer before \
 doing anything else. find_artist_for_song only identifies songs; it is not for \
@@ -54,11 +60,11 @@ list of the songs, with a few words on why they fit. Keep it short.
 Downloading songs:
 - Only call download_songs_from_youtube when the user explicitly asks to download. \
 Never download as part of a normal playlist request.
-- Every song you pass must have a full YouTube URL taken from find_on_youtube results \
-(if you only have a video ID, use https://www.youtube.com/watch?v=<ID>). Never guess URLs.
+- Every song you pass must have the video_id from find_on_youtube or \
+get_playlist_songs. Never guess video IDs.
 - If the user asks to download songs from one of their playlists (including one you \
 just built), get its playlist_id from get_music_memory and call get_playlist_songs. \
-Use the saved URLs as they are; only songs without a URL need find_on_youtube. \
+Use the saved video IDs as they are; only songs without one need find_on_youtube. \
 If they ask to download without a playlist, find the songs with steps 3-6 and skip \
 creating a playlist unless they also want one.
 - Quality: use "mp3" unless the user asks for video ("480p", "720p" or "best").
@@ -67,6 +73,12 @@ pass output_dir if the user names a folder: a full path as they wrote it, or a p
 folder name, which is created inside Downloads.
 - After downloading, report which songs succeeded, which failed and why, and the \
 folder they were saved to.
+
+Session log: each earlier request in this conversation ends with an "[App log of \
+request #N]" block, written automatically by the app. It lists the tools that ran, \
+short results and every error. Use it to know what actually happened earlier (for \
+example why a tool failed), and call get_session_log for the full details when the \
+short log is not enough. Never write such logs yourself.
 
 If a tool returns an error, read it and adapt (try another spelling, tag or song) \
 instead of giving up. If the YouTube quota is exhausted, tell the user and stop. \
@@ -82,42 +94,74 @@ caused by the user's NetFree filter, not by a bug, quota or outdated software. N
 suggest updating yt-dlp or retrying the same video for it.
 - When something is blocked, say so explicitly in Hebrew, e.g. "השיר X חסום בנטפרי", \
 and suggest a replacement or that the user ask NetFree to approve it.
-- In NetFree mode prefer clean, family-friendly songs, and avoid songs whose titles \
-contain offensive words: they will likely be blocked."""
+- Most mainstream Western (non-Jewish) music videos are NOT approved on NetFree. \
+Unless the user asks for specific Western songs or artists, choose Israeli and Jewish \
+music (e.g. Jewish/Hasidic, Israeli soft/acoustic, piyyutim, niggunim), which is far \
+more likely to be approved. This saves many blocked searches.
+- Prefer clean, family-friendly songs, and avoid songs whose titles contain offensive \
+words: they will likely be blocked."""
+
+
+ADDRESS_FORMS = {
+    "female": "Address the user in feminine Hebrew forms (את, רוצה, תגידי...).",
+    "male": "Address the user in masculine Hebrew forms (אתה, רוצה, תגיד...).",
+    "neutral": "Address the user in gender-neutral Hebrew (plural or impersonal forms).",
+}
 
 
 def system_prompt() -> list[dict]:
     text = SYSTEM_PROMPT
+    settings = memory.get_settings()
+    if settings.get("address_user_as") in ADDRESS_FORMS:
+        text += "\n\n" + ADDRESS_FORMS[settings["address_user_as"]]
     if netfree.is_enabled():
         text += ("\n\n" + NETFREE_PROMPT + "\n\nNetFree mode is ON: this user is on NetFree. "
                  "find_on_youtube already removes blocked videos, so use only the "
                  "candidates it returns.")
     # Cache breakpoint: the tool definitions + system prompt are identical in every
-    # call, so after the first call they are read from cache at ~10% of the price.
-    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+    # call, so they are read from cache at a fraction of the price. They are kept
+    # for 1 hour (the longest option), so a pause between requests doesn't force
+    # an expensive re-write. 1-hour writes cost more, but happen far less often.
+    return [{"type": "text", "text": text,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
 
 
-def as_tool(fn, external: bool = False):
+def as_tool(fn, external: bool = False, memory_data: bool = False):
     """Wrap one of our functions as a Claude tool that returns a JSON string.
 
-    external=True marks tools that return text from YouTube/Last.fm. In NetFree
-    mode, items with offensive words are removed from their results before the
-    results are sent to Claude, so NetFree won't block the request.
+    Every call is recorded in the session log, and errors are printed to the
+    console. In NetFree mode, items with offensive words are removed from the
+    results of these tools before they are sent to Claude, so NetFree won't
+    block the request:
+    - external=True: text from YouTube/Last.fm (if everything is removed, the
+      agent gets a clear error);
+    - memory_data=True: the user's saved songs (removed items are just noted).
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        result = fn(*args, **kwargs)
-        if external and netfree.is_enabled():
-            result = netfree.filter_result(result)
+        start = time.time()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as e:  # a bug in a tool must not crash the whole request
+            result = {"error": f"The tool crashed: {type(e).__name__}: {e}"}
+        note = ""
+        if (external or memory_data) and netfree.is_enabled():
+            result, note = netfree.filter_with_report(result, error_if_all_removed=external)
+        session_log.record_call(fn.__name__, dict(kwargs), result, time.time() - start, note)
+        for error in session_log.errors_in(result)[:3]:
+            print(f"      ↳ {fn.__name__}: שגיאה: {error[:150]}")
+        if note:
+            print(f"      ↳ {fn.__name__}: נטפרי: {note}")
         return json.dumps(result, ensure_ascii=False)
     return beta_tool(wrapper)
 
 
 TOOLS = [
-    as_tool(memory.get_music_memory),
+    as_tool(memory.get_music_memory, memory_data=True),
     as_tool(memory.remember_songs),
     as_tool(memory.record_playlist),
-    as_tool(memory.get_playlist_songs),
+    as_tool(memory.get_playlist_songs, memory_data=True),
+    as_tool(memory.update_user_settings),
     as_tool(lastfm.get_similar_tracks, external=True),
     as_tool(lastfm.get_similar_artists, external=True),
     as_tool(lastfm.get_artist_top_tracks, external=True),
@@ -127,7 +171,8 @@ TOOLS = [
     as_tool(youtube.find_on_youtube, external=True),
     as_tool(youtube.create_playlist),
     as_tool(youtube.add_to_playlist),
-    as_tool(youtube_download.download_songs_from_youtube)
+    as_tool(youtube_download.download_songs_from_youtube),
+    as_tool(session_log.get_session_log),
 ]
 
 
@@ -165,18 +210,38 @@ def _run(client: Anthropic, messages: list[dict], tools_used: list[str],
                 tools_used.append(block.name)
         u = message.usage
         usage["input"] += u.input_tokens or 0
-        usage["cache_write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
+        written = getattr(u, "cache_creation_input_tokens", 0) or 0
+        usage["cache_write"] += written
+        # Split of the cache writes by lifetime (1-hour writes are priced higher).
+        details = getattr(u, "cache_creation", None)
+        written_1h = (getattr(details, "ephemeral_1h_input_tokens", 0) or 0) if details else 0
+        usage["cache_write_1h"] += written_1h
         usage["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
         usage["output"] += u.output_tokens or 0
         final_message = message
     return "".join(b.text for b in final_message.content if b.type == "text").strip()
 
 
+# Price in USD per million tokens for MODEL (claude-sonnet-5-5). Update these if
+# you change the model: https://platform.claude.com/docs/en/about-claude/pricing
+PRICES = {"input": 2.00, "cache_write_5m": 2.50, "cache_write_1h": 4.00,
+          "cache_read": 0.10, "output": 10.00}
+
+
+def _cost(usage: dict) -> float:
+    write_5m = usage["cache_write"] - usage["cache_write_1h"]
+    return (usage["input"] * PRICES["input"]
+            + write_5m * PRICES["cache_write_5m"]
+            + usage["cache_write_1h"] * PRICES["cache_write_1h"]
+            + usage["cache_read"] * PRICES["cache_read"]
+            + usage["output"] * PRICES["output"]) / 1_000_000
+
+
 def _usage_line(usage: dict) -> str:
     total_in = usage["input"] + usage["cache_write"] + usage["cache_read"]
     return (f"  [tokens] input {total_in:,} (from cache {usage['cache_read']:,}, "
             f"written to cache {usage['cache_write']:,}, uncached {usage['input']:,}) | "
-            f"output {usage['output']:,}")
+            f"output {usage['output']:,} | cost ≈ ${_cost(usage):.4f}")
 
 
 def _retry_note(tools_used: list[str]) -> str:
@@ -193,31 +258,72 @@ def _retry_note(tools_used: list[str]) -> str:
     )
 
 
+KEEP_LOGS_FOR = 15  # requests; older app logs are dropped from history to save tokens
+
+
+def _assistant_turn(reply: str, number: int) -> dict:
+    """The assistant's reply plus the app log of what happened in this request."""
+    return {"role": "assistant", "content": [
+        {"type": "text", "text": reply or "(no reply)"},
+        {"type": "text", "text": session_log.request_notes(number)},
+    ]}
+
+
+def _trim_old_logs(history: list[dict]) -> None:
+    turns = [m for m in history if m["role"] == "assistant" and isinstance(m["content"], list)]
+    for message in turns[:-KEEP_LOGS_FOR]:
+        message["content"] = message["content"][:1]
+
+
 def ask(client: Anthropic, history: list[dict], user_text: str) -> str:
     history.append({"role": "user", "content": user_text})
+    number = session_log.start_request(user_text)
     tools_used: list[str] = []
-    usage = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
+    usage = {"input": 0, "cache_write": 0, "cache_write_1h": 0, "cache_read": 0, "output": 0}
     try:
-        reply = _run(client, list(history), tools_used, usage)
-    except Exception as e:
-        if not netfree.is_api_block(e):
-            raise
-        # NetFree blocked the request. Retry once without the blocked tool
-        # results: a fresh request that only says what was already done.
-        netfree.enable("זוהתה חסימה של נטפרי")
-        print("  [netfree] הבקשה ל-Claude נחסמה על ידי נטפרי - מנסה שוב בלי התוכן שנחסם...")
-        retry_messages = history[:-1] + [{"role": "user",
-                                          "content": user_text + _retry_note(tools_used)}]
         try:
-            reply = _run(client, retry_messages, tools_used, usage)
-        except Exception as e2:
-            if netfree.is_api_block(e2):
-                raise NetFreeBlocked(tools_used) from e2
-            raise
+            reply = _run(client, list(history), tools_used, usage)
+        except Exception as e:
+            if not netfree.is_api_block(e):
+                raise
+            # NetFree blocked the request. Retry once without the blocked tool
+            # results: a fresh request that only says what was already done.
+            netfree.enable("זוהתה חסימה של נטפרי")
+            if not memory.get_settings().get("netfree"):
+                memory.update_user_settings(netfree="on")  # remember for next sessions
+                session_log.record_event("NetFree mode turned on and saved, because "
+                                         "NetFree blocked a request.")
+            session_log.mark_calls_blocked()
+            session_log.record_event("NetFree blocked the request to Claude (word filter on "
+                                     "tool results); retried once without those results.")
+            print("  [netfree] הבקשה ל-Claude נחסמה על ידי נטפרי - מנסה שוב בלי התוכן שנחסם...")
+            retry_messages = history[:-1] + [{"role": "user",
+                                              "content": user_text + _retry_note(tools_used)}]
+            try:
+                reply = _run(client, retry_messages, tools_used, usage)
+            except Exception as e2:
+                if netfree.is_api_block(e2):
+                    session_log.mark_calls_blocked()
+                    session_log.record_event("NetFree blocked the retry too. The user got no "
+                                             "reply to this request.")
+                    raise NetFreeBlocked(tools_used) from e2
+                raise
+    except NetFreeBlocked:
+        session_log.end_request(None, "blocked_by_netfree")
+        history.append(_assistant_turn("(No reply: blocked by NetFree.)", number))
+        raise
+    except Exception as e:
+        session_log.record_event(f"The request failed with an error: {type(e).__name__}: {e}")
+        session_log.end_request(None, "error")
+        history.append(_assistant_turn("(No reply: the request failed with an error.)", number))
+        print(_usage_line(usage))
+        raise
 
-    # Keep only the text of the final answer in the history; the details of the
-    # tool calls are not needed for the next request (memory keeps what matters).
-    history.append({"role": "assistant", "content": reply or "(no reply)"})
+    session_log.end_request(reply, "ok")
+    # The history keeps the reply plus a compact log of the tools and errors,
+    # so later requests know what happened. Full details: get_session_log.
+    history.append(_assistant_turn(reply, number))
+    _trim_old_logs(history)
     print(_usage_line(usage))
     return reply
 
@@ -239,7 +345,10 @@ def main():
     client = Anthropic()
     history: list[dict] = []
     print("Music agent ready. Type 'exit' to quit.")
-    print(netfree.init() + "\n")
+    print(netfree.init(memory.get_settings().get("netfree")))
+    session_log.record_event(f"Startup. {netfree.status_line()}. "
+                             f"Certificate issuer: {netfree.certificate_issuer()}")
+    print(f"יומן הסשן נשמר ב-{session_log.LOG_FILE.name}\n")
 
     while True:
         try:
@@ -254,15 +363,10 @@ def main():
         try:
             reply = ask(client, history, user_text)
         except NetFreeBlocked as e:
-            message = _blocked_message(e.tools_used)
-            # Keep the request in history, so the agent knows what happened.
-            history.append({"role": "assistant",
-                            "content": "(The reply to this request was blocked by NetFree. "
-                                       f"Tools that ran: {', '.join(e.tools_used) or 'none'}.)"})
-            print(f"\n{message}\n")
+            # ask() already kept the request and its log in history.
+            print(f"\n{_blocked_message(e.tools_used)}\n")
             continue
         except Exception as e:
-            history.pop()  # drop the request that failed
             print(f"\nError: {e}\n")
             continue
 
