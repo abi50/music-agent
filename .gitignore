@@ -3,3 +3,7 @@ client_secret.json
 token.json
 venv/
 .idea/
+music_memory.json
+youtube_cache.json
+downloads/
+__pycache__/

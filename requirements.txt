@@ -1,0 +1,8 @@
+anthropic==1.13.0
+python-dotenv==1.2.4
+pylast==7.2.0
+google-api-python-client==2.201.0
+google-auth==2.61.0
+google-auth-oauthlib==1.5.0
+truststore==0.10.4
+yt-dlp>=2026.1.1
